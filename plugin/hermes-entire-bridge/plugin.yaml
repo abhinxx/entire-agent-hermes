@@ -1,0 +1,10 @@
+name: hermes-entire-bridge
+version: 0.1.0
+description: "Capture Hermes Agent sessions into Entire checkpoints. Forwards session lifecycle and transcript lines to `entire hooks hermes <hook>` so every Hermes turn gets an inspectable git checkpoint. Requires the entire-agent-hermes binary on PATH and `entire enable --agent hermes` in the repo."
+author: "Abhinav Singh (abhinxx)"
+provides_hooks:
+  - on_session_start
+  - post_llm_call
+  - post_tool_call
+  - on_session_end
+  - on_session_reset

@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""entire-agent-hermes — Entire external agent integration for Hermes Agent.
+
+Implements the Entire agent-integration protocol v1
+(https://docs.entire.io/agents/agent-integration-protocol/overview).
+
+The Hermes side of the bridge is a Hermes plugin (see ../plugin/) that
+forwards lifecycle payloads to `entire hooks hermes <hook>`. This binary is
+invoked by the Entire CLI with subcommands on stdin/stdout JSON. Stateless;
+no network. Requires only Python 3.8+ stdlib.
+
+Session storage (must match the plugin's path logic):
+    ~/.entire-hermes/sessions/<repo-slug>/<profile>-<session_id>.jsonl
+Repo slug: repo path with os.sep -> '-' plus sha256(path)[:8] suffix.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+AGENT_NAME = "hermes"
+PROTOCOL_VERSION = 1
+# Hermes lifecycle hooks this integration handles (invoked via
+# `entire hooks hermes <name>` by the Hermes plugin).
+HOOK_NAMES = ["session-start", "user-prompt-submit", "stop", "session-end"]
+
+EVENT_SESSION_START, EVENT_TURN_START, EVENT_TURN_END, EVENT_SESSION_END = 1, 2, 3, 5
+
+
+def _now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fatal(msg):
+    print(("entire-agent-hermes: " + msg), file=sys.stderr)
+    sys.exit(1)
+
+
+def read_stdin_bytes():
+    return sys.stdin.buffer.read()
+
+
+def read_json_stdin():
+    data = sys.stdin.read()
+    if not data.strip():
+        return {}
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as e:
+        fatal("invalid JSON on stdin: %s" % e)
+
+
+def write_json(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.flush()
+
+
+def get_flag(name):
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+def has_flag(name):
+    return name in sys.argv[1:]
+
+
+def repo_root():
+    return os.environ.get("ENTIRE_REPO_ROOT") or os.getcwd()
+
+
+# --- session paths (shared contract with the Hermes plugin) ---------------
+
+def sessions_base():
+    return os.path.join(os.path.expanduser("~"), ".entire-hermes", "sessions")
+
+
+def repo_slug(repo_path):
+    abs_path = os.path.abspath(repo_path)
+    mangled = abs_path.replace(os.sep, "-").strip("-")
+    digest = hashlib.sha256(abs_path.encode()).hexdigest()[:8]
+    return "%s-%s" % (mangled, digest)
+
+
+# --- protocol subcommands --------------------------------------------------
+
+def cmd_info():
+    write_json({
+        "protocol_version": PROTOCOL_VERSION,
+        "name": AGENT_NAME,
+        "type": "Hermes Agent",
+        "description": "Hermes Agent (Nous Research) - open-source AI agent harness",
+        "protected_dirs": [".entire-hermes"],
+        "hook_names": HOOK_NAMES,
+        "capabilities": {
+            "hooks": True,
+            "transcript_analyzer": True,
+            "transcript_preparer": False,
+            "token_calculator": False,
+            "text_generator": False,
+            "hook_response_writer": False,
+            "subagent_aware_extractor": False,
+        },
+    })
+
+
+def cmd_detect():
+    # Hermes is present if the CLI binary is on PATH or a hermes home exists.
+    import shutil
+    present = bool(shutil.which("hermes")) or os.path.isdir(
+        os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    write_json({"present": present})
+
+
+def cmd_get_session_id():
+    inp = read_json_stdin()
+    sid = inp.get("session_id") or ""
+    if not sid:
+        fatal("no session_id in hook input")
+    write_json({"session_id": sid})
+
+
+def cmd_get_session_dir():
+    repo = get_flag("--repo-path") or repo_root()
+    write_json({"session_dir": os.path.join(sessions_base(), repo_slug(repo))})
+
+
+def cmd_resolve_session_file():
+    session_dir = get_flag("--session-dir")
+    session_id = get_flag("--session-id")
+    if not session_dir or not session_id:
+        fatal("--session-dir and --session-id are required")
+    write_json({"session_file": os.path.join(session_dir, session_id + ".jsonl")})
+
+
+def _transcript_from_hook_input(inp):
+    """The plugin injects transcript_path into every forwarded payload."""
+    return inp.get("transcript_path") or inp.get("session_ref") or ""
+
+
+def cmd_read_session():
+    inp = read_json_stdin()
+    sid = inp.get("session_id", "")
+    ref = _transcript_from_hook_input(inp)
+    session = {
+        "session_id": sid,
+        "agent_name": AGENT_NAME,
+        "repo_path": inp.get("cwd") or repo_root(),
+        "session_ref": ref,
+        "start_time": inp.get("timestamp") or _now(),
+        "native_data": None,
+        "modified_files": [],
+        "new_files": [],
+        "deleted_files": [],
+    }
+    # If a session record exists next to the transcript, trust it.
+    if ref:
+        meta = ref + ".session.json"
+        try:
+            with open(meta) as f:
+                stored = json.load(f)
+            if isinstance(stored, dict):
+                session.update({k: v for k, v in stored.items() if v})
+        except OSError:
+            pass
+    write_json(session)
+
+
+def cmd_write_session():
+    session = read_json_stdin()
+    if not session.get("session_ref"):
+        fatal("session_ref is required")
+    meta = session["session_ref"] + ".session.json"
+    os.makedirs(os.path.dirname(meta), exist_ok=True)
+    with open(meta, "w") as f:
+        json.dump(session, f)
+
+
+def cmd_read_transcript():
+    ref = get_flag("--session-ref")
+    try:
+        with open(ref, "rb") as f:
+            sys.stdout.buffer.write(f.read())
+    except OSError as e:
+        fatal("read transcript: %s" % e)
+
+
+def cmd_chunk_transcript():
+    try:
+        max_size = int(get_flag("--max-size"))
+    except ValueError:
+        fatal("invalid --max-size")
+    data = read_stdin_bytes()
+    chunks, cur = [], bytearray()
+    for line in data.splitlines(keepends=True):
+        if cur and len(cur) + len(line) > max_size:
+            chunks.append(bytes(cur))
+            cur = bytearray()
+        cur.extend(line)
+    if cur:
+        chunks.append(bytes(cur))
+    write_json({"chunks": [base64.b64encode(c).decode() for c in chunks]})
+
+
+def cmd_reassemble_transcript():
+    inp = read_json_stdin()
+    for c in inp.get("chunks", []):
+        if isinstance(c, str):
+            sys.stdout.buffer.write(base64.b64decode(c))
+        else:
+            sys.stdout.buffer.write(bytes(c))
+
+
+def cmd_format_resume_command():
+    sid = get_flag("--session-id")
+    write_json({"command": "hermes --resume %s" % sid})
+
+
+# --- hooks capability ------------------------------------------------------
+
+def cmd_parse_hook():
+    hook = get_flag("--hook")
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        write_json(None)
+        return
+    sid = payload.get("session_id") or ""
+    if not sid:
+        write_json(None)
+        return
+    types = {
+        "session-start": EVENT_SESSION_START,
+        "user-prompt-submit": EVENT_TURN_START,
+        "stop": EVENT_TURN_END,
+        "session-end": EVENT_SESSION_END,
+    }
+    etype = types.get(hook)
+    if etype is None:
+        write_json(None)
+        return
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    prompt = payload.get("user_prompt") or payload.get("user_message") \
+        or extra.get("user_message") or ""
+    model = payload.get("model") or extra.get("model") or ""
+    event = {
+        "type": etype,
+        "session_id": sid,
+        "timestamp": payload.get("timestamp") or _now(),
+    }
+    ref = _transcript_from_hook_input(payload)
+    if ref:
+        event["session_ref"] = ref
+    if prompt:
+        event["prompt"] = prompt
+    if model:
+        event["model"] = model
+    prev = payload.get("previous_session_id") or extra.get("previous_session_id") \
+        or extra.get("old_session_id")
+    if etype == EVENT_SESSION_START and prev:
+        event["previous_session_id"] = prev
+    write_json(event)
+
+
+def _hooks_marker_dir():
+    return os.path.join(repo_root(), ".entire-hermes", "hooks")
+
+
+def _git_exclude_marker():
+    """Keep our hook-marker dir out of `git status` via .git/info/exclude."""
+    try:
+        root = repo_root()
+        git_dir = os.path.join(root, ".git")
+        if os.path.isfile(git_dir):  # worktree: .git is a file pointing elsewhere
+            with open(git_dir) as f:
+                line = f.read().strip()
+            if line.startswith("gitdir:"):
+                git_dir = line.split(":", 1)[1].strip()
+        exclude = os.path.join(git_dir, "info", "exclude")
+        os.makedirs(os.path.dirname(exclude), exist_ok=True)
+        try:
+            with open(exclude) as f:
+                existing = f.read()
+        except OSError:
+            existing = ""
+        if ".entire-hermes/" not in existing:
+            with open(exclude, "a") as f:
+                f.write("\n.entire-hermes/\n")
+    except Exception:
+        pass  # cosmetic only
+
+
+def cmd_install_hooks():
+    d = _hooks_marker_dir()
+    os.makedirs(d, exist_ok=True)
+    _git_exclude_marker()
+    n = 0
+    for name in HOOK_NAMES:
+        p = os.path.join(d, name + ".json")
+        data = json.dumps({
+            "hook": name,
+            "agent": AGENT_NAME,
+            "note": "Capture is driven by the Hermes plugin 'hermes-entire-bridge' "
+                    "forwarding payloads via `entire hooks hermes %s`." % name,
+            "forward_command": "entire hooks hermes %s" % name,
+        })
+        if not os.path.exists(p) or has_flag("--force"):
+            with open(p, "w") as f:
+                f.write(data)
+            n += 1
+    write_json({"hooks_installed": n})
+
+
+def cmd_uninstall_hooks():
+    import shutil
+    shutil.rmtree(_hooks_marker_dir(), ignore_errors=True)
+
+
+def cmd_are_hooks_installed():
+    d = _hooks_marker_dir()
+    installed = all(os.path.exists(os.path.join(d, n + ".json")) for n in HOOK_NAMES)
+    write_json({"installed": installed})
+
+
+# --- transcript_analyzer capability ------------------------------------------
+# Transcript is JSONL written by the Hermes plugin:
+#   {"type":"user","timestamp":...,"message":{"content":"..."}}
+#   {"type":"assistant","timestamp":...,"message":{"content":[{"type":"text",...}]}}
+#   {"type":"tool","timestamp":...,"tool_name":"write_file","tool_input":{...}}
+
+def _read_lines(path):
+    try:
+        with open(path, "rb") as f:
+            return [l for l in f.read().split(b"\n") if l.strip()]
+    except OSError:
+        return []
+
+
+def _parse(line):
+    try:
+        return json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def cmd_get_transcript_position():
+    write_json({"position": len(_read_lines(get_flag("--path")))})
+
+
+TOOL_FILE_KEYS = ("path", "file_path")
+FILE_TOOLS = {"write_file", "patch", "skill_manage"}
+
+
+def _tool_files(obj):
+    out = []
+    if obj.get("type") != "tool":
+        return out
+    if obj.get("tool_name") not in FILE_TOOLS:
+        return out
+    ti = obj.get("tool_input")
+    if not isinstance(ti, dict):
+        return out
+    for k in TOOL_FILE_KEYS:
+        v = ti.get(k)
+        if isinstance(v, str) and v:
+            out.append(v)
+    return out
+
+
+def cmd_extract_modified_files():
+    lines = _read_lines(get_flag("--path"))
+    try:
+        offset = int(get_flag("--offset"))
+    except ValueError:
+        offset = 0
+    files, seen = [], set()
+    for raw in lines[offset:]:
+        obj = _parse(raw)
+        if not obj:
+            continue
+        for f in _tool_files(obj):
+            if f not in seen:
+                seen.add(f)
+                files.append(f)
+    write_json({"files": files, "current_position": len(lines)})
+
+
+def _user_text(obj):
+    if obj.get("type") != "user":
+        return ""
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        c = msg.get("content")
+        if isinstance(c, str):
+            return c
+    return ""
+
+
+def cmd_extract_prompts():
+    lines = _read_lines(get_flag("--session-ref"))
+    try:
+        offset = int(get_flag("--offset"))
+    except ValueError:
+        offset = 0
+    prompts = []
+    for raw in lines[offset:]:
+        obj = _parse(raw)
+        if obj:
+            t = _user_text(obj)
+            if t:
+                prompts.append(t)
+    write_json({"prompts": prompts})
+
+
+def cmd_extract_summary():
+    lines = _read_lines(get_flag("--session-ref"))
+    for raw in lines:
+        obj = _parse(raw)
+        if obj:
+            t = _user_text(obj)
+            if t:
+                summary = t if len(t) <= 120 else t[:120] + "..."
+                write_json({"summary": summary, "has_summary": True})
+                return
+    write_json({"summary": "", "has_summary": False})
+
+
+COMMANDS = {
+    "info": cmd_info,
+    "detect": cmd_detect,
+    "get-session-id": cmd_get_session_id,
+    "get-session-dir": cmd_get_session_dir,
+    "resolve-session-file": cmd_resolve_session_file,
+    "read-session": cmd_read_session,
+    "write-session": cmd_write_session,
+    "read-transcript": cmd_read_transcript,
+    "chunk-transcript": cmd_chunk_transcript,
+    "reassemble-transcript": cmd_reassemble_transcript,
+    "format-resume-command": cmd_format_resume_command,
+    "parse-hook": cmd_parse_hook,
+    "install-hooks": cmd_install_hooks,
+    "uninstall-hooks": cmd_uninstall_hooks,
+    "are-hooks-installed": cmd_are_hooks_installed,
+    "get-transcript-position": cmd_get_transcript_position,
+    "extract-modified-files": cmd_extract_modified_files,
+    "extract-prompts": cmd_extract_prompts,
+    "extract-summary": cmd_extract_summary,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        fatal("usage: entire-agent-hermes <subcommand>  (see protocol docs)")
+    COMMANDS[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()
