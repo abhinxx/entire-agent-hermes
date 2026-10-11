@@ -1,0 +1,21 @@
+# mise tasks — same contract the external-agents CI expects from a Python-shape
+# integration: [tasks.build] emits ./entire-agent-hermes inside this dir;
+# [tasks.test] runs unit tests plus a protocol smoke. Used if this lands under
+# agents/entire-agent-hermes in entireio/external-agents.
+
+[tasks.build]
+description = "Emit the entire-agent-hermes executable inside this directory"
+run = """
+cp bin/entire-agent-hermes entire-agent-hermes
+chmod +x entire-agent-hermes
+"""
+
+[tasks.test]
+description = "Unit tests + protocol smoke"
+run = """
+python3 tests/test_smoke.py
+out=$(python3 bin/entire-agent-hermes info)
+echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["protocol_version"]==1 and d["name"]=="hermes"'
+printf '{"session_id":"s","transcript_path":"/tmp/s.jsonl"}' | python3 bin/entire-agent-hermes parse-hook --hook stop | grep -q '"type": 3'
+echo "protocol smoke OK"
+"""

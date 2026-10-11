@@ -98,6 +98,8 @@ bin/entire-agent-hermes          protocol binary (Python 3, stdlib only)
 plugin/hermes-entire-bridge/     Hermes plugin (plugin.yaml + __init__.py)
 tests/test_smoke.py              protocol smoke tests
 install.sh                       one-shot installer
+mise.toml                        build/test tasks (external-agents CI contract)
+AGENT.md                         protocol/design doc (research, hook mapping, gaps)
 docs/                            research notes (upstream conventions, Hermes hook kwargs)
 ```
 
