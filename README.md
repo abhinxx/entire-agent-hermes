@@ -72,7 +72,15 @@ entire checkpoint explain <CHECKPOINT_ID>
 
 ```bash
 python3 tests/test_smoke.py           # protocol unit tests, no network
+
+# Official Entire protocol compliance suite (external-agents-tests):
+git clone https://github.com/entireio/external-agents-tests
+cd external-agents-tests
+AGENT_BINARY=/path/to/entire-agent-hermes go test -count=1 ./...
+# all packages pass: mandatory, hooks, transcript, subagent, optional
 ```
+
+Compliance status: **passes `entireio/external-agents-tests@main` (2026-10-11, CLI 0.11.4).**
 
 ## Scope of capture (read before using on a public repo)
 

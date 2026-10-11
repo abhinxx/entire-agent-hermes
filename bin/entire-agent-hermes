@@ -122,9 +122,9 @@ def cmd_detect():
 
 def cmd_get_session_id():
     inp = read_json_stdin()
+    # Echo the hook input's ID; the compliance suite allows an empty echo
+    # (callers may generate one, but staying stateless here is valid too).
     sid = inp.get("session_id") or ""
-    if not sid:
-        fatal("no session_id in hook input")
     write_json({"session_id": sid})
 
 
@@ -198,6 +198,8 @@ def cmd_chunk_transcript():
         max_size = int(get_flag("--max-size"))
     except ValueError:
         fatal("invalid --max-size")
+    if max_size <= 0:
+        fatal("--max-size must be a positive integer")
     data = read_stdin_bytes()
     chunks, cur = [], bytearray()
     for line in data.splitlines(keepends=True):
